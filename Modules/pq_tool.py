@@ -114,7 +114,7 @@ def getColumns(
     dbName: str,
 ) -> List:
     conn = duckdb.connect(dbName)
-    cols = [ el[0] for el in conn.sql(f"SELECT name FROM pqschema").to_df().values.tolist()[1:] ]
+    cols = [ el[0] for el in conn.sql(f"SELECT name FROM pqschema order by 1").to_df().values.tolist() ]
     conn.close()
     return cols
 @app.get('/')
@@ -148,10 +148,12 @@ def prepMeta(
                 ENDPOINT "storage.yandexcloud.net", REGION 'ru-central1')
         """)
     # save parquet filename and metadata - будем работать с первым файлом (в случае, если их несколько)
-    conn.sql(f"create table filename as SELECT filename as name, size FROM read_blob('{PQ_FILE}') limit 1")
+    conn.sql(f"create table filename as SELECT filename as name, size, '(none)' as author, 1 as version FROM read_blob('{PQ_FILE}') limit 1")
     PQ_FILE = conn.sql("select name from filename").df().values.tolist()[0][0] # уточним название файла с которым работаем для последующей формы
     conn.sql(f"create table pqmeta as SELECT * FROM parquet_metadata('{PQ_FILE}')")
-    conn.sql(f"create table pqschema as SELECT * FROM parquet_schema('{PQ_FILE}')")
+    conn.sql(f"create table pqschema as SELECT * FROM parquet_schema('{PQ_FILE}') WHERE num_children IS NULL")
+    author,version = conn.sql(f"SELECT created_by, format_version FROM parquet_file_metadata('{PQ_FILE}')").df().values[0]
+    conn.sql(f"update filename set author = '{author}', version = {version}")
     conn.close()
 @app.post('/main')
 @app.get('/main')
@@ -251,6 +253,7 @@ def prepColChart(
             num_values as num_rows,
             stats_min_value as min, 
             stats_max_value as max, 
+            stats_max_value::int - stats_min_value::int as span, 
             stats_null_count as nulls,
             row_group_id as rg
         from pqmeta 
@@ -258,7 +261,6 @@ def prepColChart(
             path_in_schema='{ colName }'
     """).df()
     conn.close()
-    df["span"] = df["max"].astype(int) - df["min"].astype(int)
     df["rg_label"] = "RG " + df["rg"].astype(str)
     fig = px.bar(
         df,
@@ -302,7 +304,7 @@ def showColChart(
         cols = request.forms.colstr.split(",")
         plotly_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
     else:
-        cols = [ el[0] for el in conn.sql(f"SELECT name FROM pqschema where type='INT32'").to_df().values.tolist()[1:] ]
+        cols = [ el[0] for el in conn.sql(f"SELECT name FROM pqschema where type='INT32' order by 1").to_df().values.tolist() ]
         colName = cols[0]
         plotly_html = None
     conn.close()
@@ -327,7 +329,7 @@ def prepOverview(
     lang: str,
 ) -> List:
     conn = duckdb.connect(dbName)
-    PQ_FILE,size = conn.sql("select name,size from filename").df().values.tolist()[0]
+    PQ_FILE,size,author,version = conn.sql("select * from filename").df().values.tolist()[0]
     grpNum = conn.sql("select max(row_group_id)+1 from pqmeta").df().values.tolist()[0][0]
     rowNum = int(conn.sql("select sum(num_values) from pqmeta where column_id=0").df().values.tolist()[0][0])
     rszList = conn.sql("select num_values, count(*) from pqmeta where column_id=0 group by 1").df().values.tolist()
@@ -360,6 +362,8 @@ def prepOverview(
                 ("row groups",grpNum),
                 ("file size",mkd(size)+" bytes"),
                 ("compressions",compressions),
+                ("created by",author),
+                ("version",version)
             ]
         ],
         [
@@ -425,7 +429,8 @@ def prepRowGroupStats(
             bloom_filter_length,
             data_page_offset,
             dictionary_page_offset,
-            total_compressed_size
+            total_compressed_size,
+            total_uncompressed_size
         from pqmeta 
         where 
             row_group_id={rowGroupInd} 
@@ -449,6 +454,7 @@ def prepRowGroupStats(
         _("data_page_offset",lang),
         _("dictionary_page_offset",lang),
         _("total_compressed_size",lang),
+        _("total_uncompressed_size",lang),
     ]
     return dict(zip(resDf.columns,zip(resDf.iloc[0],comments)))
 @app.post('/show_row_group_stats')
@@ -466,7 +472,7 @@ def showRowGroupStats(
         grpNum = int(request.forms.grpnumbstr)
     else: # первый вызов - из кнопки на главной форме, нужно заполнить поля формы
         grpNum = conn.sql("select max(row_group_id)+1 from pqmeta").df().values.tolist()[0][0]
-        cols = [ el[0] for el in conn.sql(f"SELECT name FROM pqschema").to_df().values.tolist()[1:] ]
+        cols = [ el[0] for el in conn.sql(f"SELECT name FROM pqschema order by 1").to_df().values.tolist() ]
         resRow = None
         colName = cols[0]
         rowGroupInd = 0
@@ -517,7 +523,7 @@ def showProbeBloomFilter(
         retStr = probeBloomFilter(dbName,lang,colName,colValue)
     else: # первый вызов
         colName = request.forms.field_name
-        cols = [ el[0] for el in conn.sql(f"select distinct(path_in_schema) from pqmeta where bloom_filter_offset is not NULL").to_df().values.tolist()[1:] ]
+        cols = [ el[0] for el in conn.sql(f"select distinct(path_in_schema) from pqmeta where bloom_filter_offset is not NULL order by 1").to_df().values.tolist() ]
         colValue = ""
         retStr = None
     conn.close()
